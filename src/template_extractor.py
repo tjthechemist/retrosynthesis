@@ -333,3 +333,54 @@ def reassign_atom_mapping(transform: str) -> str:
     transform_newmaps = re.sub(r"\:[0-9]+\]", lambda match: (f":{replacements.pop(0)}]"), transform)
     return transform_newmaps
 
+def get_strict_smarts_for_atom(atom: Chem.Atom) -> str:
+    symbol = atom.GetSmarts()
+    if atom.GetSymbol() == "H":
+        symbol = "[#1]"
+
+    if "[" not in symbol:
+        symbol = f"[{symbol}]"
+
+    if atom.GetChiralTag() != Chem.CHI_UNSPECIFIED:
+        if "@" not in symbol:
+            if atom.GetChiralTag() == Chem.CHI_TETRAHEDRAL_CCW:
+                tag = "@"
+            elif atom.GetChiralTag() == Chem.CHI_TETRAHEDRAL_CW:
+                tag = "@@"
+            if ":" in symbol:
+                symbol = symbol.replace(":", f";{tag}:")
+            else:
+                symbol = symbol.replace("]", f";{tag}]")
+
+    if "H" not in symbol:
+        H_symbol = f"H{atom.GetTotalNumHs()}"
+        if ":" in symbol:
+            symbol = symbol.replace(":", f";{H_symbol}:")
+        else:
+            symbol = symbol.replace("]", f";{H_symbol}]")
+
+    if ":" in symbol:
+        symbol = symbol.replace(":", f";D{atom.GetDegree()}:")
+    else:
+        symbol = symbol.replace("]", f";D{atom.GetDegree()}]")
+
+    if "+" not in symbol and "-" not in symbol:
+        charge = atom.GetFormalCharge()
+        charge_symbol = "+" if (charge >= 0) else "-"
+        charge_symbol += f"{abs(charge)}"
+        if ":" in symbol:
+            symbol = symbol.replace(":", f";{charge_symbol}:")
+        else:
+            symbol = symbol.replace("]", f";{charge_symbol}]")
+
+    return symbol
+
+def expand_changed_atom_tags(changed_atom_tags, reactant_fragments: str) -> list:
+    expansion = []
+    atom_tags_in_reactant_fragments = re.findall(r"\:([0-9]+)\]", reactant_fragments)
+    for atom_tag in atom_tags_in_reactant_fragments:
+        if atom_tag not in changed_atom_tags:
+            expansion.append(atom_tag)
+    print(f"After building reactant fragments, additional labels included: {expansion}")
+    return expansion
+
