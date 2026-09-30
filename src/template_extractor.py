@@ -375,12 +375,143 @@ def get_strict_smarts_for_atom(atom: Chem.Atom) -> str:
 
     return symbol
 
-def expand_changed_atom_tags(changed_atom_tags, reactant_fragments: str) -> list:
-    expansion = []
-    atom_tags_in_reactant_fragments = re.findall(r"\:([0-9]+)\]", reactant_fragments)
+def expand_changed_atom_tags(changed_atom_tags: list[str], reactant_fragment: str) -> list[str]:
+    expansion: list[str] = []
+    atom_tags_in_reactant_fragments = re.findall(r"\:([0-9]+)\]", reactant_fragment)
     for atom_tag in atom_tags_in_reactant_fragments:
         if atom_tag not in changed_atom_tags:
             expansion.append(atom_tag)
-    print(f"After building reactant fragments, additional labels included: {expansion}")
+    print(f"After building reactant fragments, additional labels include {expansion}.")
     return expansion
 
+def get_fragments_for_changed_atoms(molecules: list[Chem.Mol], changed_atom_tags: list[str], radius: int = 0, category: str = "reactants", expansion: list[str] = []) -> str:
+    fragments: str = ""
+    mol_changed = []
+    for molecule in molecules:
+        symbol_replacements: list[tuple[int, str]] = []
+
+        if category == "reactants":
+            groups = get_special_groups(molecule)
+        elif category == "products":
+            groups: list[tuple[list[int], list[int]]] = []
+        else:
+            raise ValueError("")
+
+        atoms_to_use: list[int] = []
+        for atom in molecule.GetAtoms():
+            if ":" in atom.GetSmarts():
+                if atom.GetSmarts().split(":")[1][:-1] in changed_atom_tags:
+                    atoms_to_use.append(atom.GetIdx())
+                    symbol = get_strict_smarts_for_atom(atom)
+                    if symbol != atom.GetSmarts():
+                        symbol_replacements.append((atom.GetIdx(), symbol))
+
+        if len(atoms_to_use) > 0:
+            if category == "reactants":
+                for atom in molecule.GetAtoms():
+                    if not atom.HasProp("molAtomMapNumber"):
+                        atoms_to_use.append(atom.GetIdx())
+
+        for k in range(radius):
+            atoms_to_use, symbol_replacements = expand_atoms_to_use(molecule, atoms_to_use, groups, symbol_replacements)
+
+        if category == "products":
+            if expansion:
+                for atom in molecule.GetAtoms():
+                    if ":" not in atom.GetSmarts():
+                        continue
+                    label = atom.GetSmarts().split(":")[1][:-1]
+                    if label in expansion and label not in changed_atom_tags:
+                        atoms_to_use.append(atom.GetIdx())
+                        symbol_replacements.append((atom.GetIdx(), convert_atom_to_wildcard(atom)))
+                        print(f"Expanded label {label} to wildcard in products")
+
+            for atom in molecule.GetAtoms():
+                if not atom.HasProp("molAtomMapNumber"):
+                    atoms_to_use.append(atom.GetIdx())
+                    symbol = get_strict_smarts_for_atom(atom)
+                    symbol_replacements.append((atom.GetIdx(), symbol))
+
+        symbols = [atom.GetSmarts() for atom in molecule.GetAtoms()]
+        for i, symbol in symbol_replacements:
+            symbols[i] = symbol
+
+        if not atoms_to_use:
+            continue
+
+        tetra_consistent = False
+        num_tetra_flip   = 0
+        while not tetra_consistent and num_tetra_flip < 100:
+            molecule_copied           = deepcopy(molecule)
+            [atom.ClearProp("molAtomMapNumber") for atom in molecule_copied]
+            this_fragments            = Chem.MolFragmentToSmiles(molecule_copied, atoms_to_use, atomSymbols=symbols, allHsExplicit=True, isomericSmiles=True, allBondsExplicit=True)
+            this_fragment_molecule    = Chem.MolFromSmarts(this_fragments)
+            tetra_map_nums: list[str] = []
+            for atom in this_fragment_molecule.GetAtoms():
+                if atom.HasProp("molAtomMapNumber"):
+                    atom.SetIsotope(int(atom.GetProp("molAtomMapNumber")))
+                    if atom.GetChiralTag() != Chem.CHI_UNSPECIFIED:
+                        tetra_map_nums.append(atom.GetProp("molAtomMapNumber"))
+
+            map_to_id: dict[str, int] = {}
+            for atom in molecule.GetAtoms():
+                if atom.HasProp("molAtomMapNumber"):
+                    atom.SetIsotope(int(atom.GetProp("molAtomMapNumber")))
+                    map_to_id[atom.GetProp("molAtomMapNumber")] = atom.GetIdx()
+
+            tetra_consistent = True
+            all_matched_ids: list[int] = []
+
+            fragment_smiles = Chem.MolToSmiles(this_fragment_molecule)
+            if fragment_smiles.count(".") > 5:
+                break
+
+            for match_ids in molecule.GetSubstructMatches(this_fragment_molecule, useChirality=True):
+                all_matched_ids.extend(match_ids)
+            shuffle(tetra_map_nums)
+            for tetra_map_num in tetra_map_nums:
+                print(f"Checking consistency of tetrahedral {tetra_map_num}")
+                if map_to_id[tetra_map_num] not in all_matched_ids:
+                    tetra_consistent = False
+                    print("@@@@@@@@@@@ FRAGMENT DOES NOT MATCH PARENT MOL @@@@@@@@@@")
+                    print("@@@@@@@@@@@ FLIPPING CHIRALITY SYMBOL NOW      @@@@@@@@@@")
+                    prev_symbol = symbols[map_to_id[tetra_map_num]]
+                    if "@@" in prev_symbol:
+                        symbol = prev_symbol.replace("@@", "@")
+                    elif "@" in prev_symbol:
+                        symbol = prev_symbol.replace("@", "@@")
+                    else:
+                        raise ValueError("Need to modified symbol of tetra atom without @ or @@???")
+                    symbols[map_to_id[tetra_map_num]] = symbol
+                    num_tetra_flip += 1
+                    break
+
+            for atom in molecule.GetAtoms():
+                atom.SetIsotope(0)
+
+        if not tetra_consistent:
+            raise ValueError(f"Could not find tetra consistent tetrahedral mapping, {len(tetra_map_nums)} centers.")
+
+        fragments += f"({this_fragments})."
+        mol_changed.append(Chem.MolToSmiles(clear_mapnumber(Chem.MolFromSmiles(Chem.MolToSmiles(molecule, True))), True))
+
+    return fragments[:-1]
+
+def canonicalize_template(template: str) -> str:
+    template_nolabels           = re.sub(r"\:[0-9]+\]", r"]", template)
+    template_nolabels_molecules = template_nolabels[1:-1].split(").(")
+    template_molecules          = template[1:-1].split(").(")
+    for i in range(len(template_molecules)):
+        nolabel_molecular_fragments    = template_nolabels_molecules[i].split(".")
+        molecular_fragment             = template_molecules[i].split(".")
+        sortorder                      = [j[0] for j in sorted(enumerate(nolabel_molecular_fragments), key = lambda x:x[1])]
+        template_nolabels_molecules[i] = ".".join([nolabel_molecular_fragments[j] for j in sortorder])
+        template_molecules[i]          = ".".join([molecular_fragment[j] for j in sortorder])
+
+    sortorder = [j[0] for j in sorted(enumerate(template_nolabels_molecules), key = lambda x:x[1])]
+    template  = f"({").(".join([template_molecules[i] for i in sortorder])})"
+    return template
+
+def canonicalize_transform(transform: str) -> str:
+    transform_reordered = ">>".join([canonicalize_template(x) for x in transform.split(">>")])
+    return reassign_atom_mapping(transform_reordered)
